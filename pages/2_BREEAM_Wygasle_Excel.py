@@ -1,7 +1,4 @@
 # pages/2_BREEAM_Wygasle_Excel.py
-# BREEAM wygasłe (Excel) + mapa z geokodowaniem TYLKO wybranego rekordu.
-# Poprawka: bardziej odporne geokodowanie adresu (fallbacki + ręczna korekta + wybór providera).
-
 import os, re
 import pandas as pd
 from datetime import date
@@ -37,7 +34,7 @@ def nav_buttons(active: str = "breeam_exp"):
 nav_buttons("breeam_exp")
 
 st.title("⛔ BREEAM wygasłe")
-st.caption("Pokazuje tylko rekordy wygasłe na dzień dzisiejszy (months_to_expiry < 0) z pliku BREEAM.xlsx.")
+#st.caption("Pokazuje tylko rekordy wygasłe na dzień dzisiejszy (months_to_expiry < 0) z pliku BREEAM.xlsx.")
 st.divider()
 
 # ================== PLIKI ==================
@@ -345,6 +342,7 @@ with col_map:
             with st.expander("Pokaż użyte warianty adresu"):
                 for a in uniq[:15]:
                     st.write(a)
+
 
 
 
