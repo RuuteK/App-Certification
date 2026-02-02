@@ -9,17 +9,28 @@ from dateutil import parser as dtparser
 import streamlit as st
 from requests.auth import HTTPBasicAuth
 
-# ================== KONFIGURACJA BREEAM (credentials.py / ENV) ==================
+# ================== KONFIGURACJA BREEAM (credentials.py / ENV / st.secrets) ==================
 BASE_DEFAULT = "https://api.breeam.com/datav1"
 
+def _get_secret(key: str, default: str = "") -> str:
+    # streamlit cloud -> st.secrets
+    try:
+        if key in st.secrets:
+            return str(st.secrets.get(key))
+    except Exception:
+        pass
+    # lokalnie -> ENV
+    return os.getenv(key, default)
+
+# Najpierw próbuj credentials.py (lokalnie), potem secrets/env
 try:
     from credentials import BREEAM_USER as _CU, BREEAM_PASS as _CP
     BREEAM_USER, BREEAM_PASS = _CU, _CP
 except Exception:
-    BREEAM_USER = os.getenv("BREEAM_USER", "")
-    BREEAM_PASS = os.getenv("BREEAM_PASS", "")
+    BREEAM_USER = _get_secret("BREEAM_USER", "")
+    BREEAM_PASS = _get_secret("BREEAM_PASS", "")
 
-BREEAM_BASE = os.getenv("BREEAM_API_BASE", BASE_DEFAULT)
+BREEAM_BASE = _get_secret("BREEAM_API_BASE", BASE_DEFAULT)
 
 # ================== USTAWIENIA STRONY ==================
 st.set_page_config(page_title="BREEAM aktualne", layout="wide")
@@ -166,7 +177,7 @@ def _listify(x):
 
 # ================== API CALLS ==================
 if not (BREEAM_USER and BREEAM_PASS):
-    st.error("Brak poświadczeń. Dodaj plik credentials.py lub ustaw zmienne BREEAM_USER/BREEAM_PASS.")
+    st.error("Brak poświadczeń. Dodaj credentials.py lub ustaw BREEAM_USER/BREEAM_PASS (na Streamlit Cloud najlepiej w Secrets).")
     st.stop()
 
 auth = HTTPBasicAuth(BREEAM_USER, BREEAM_PASS)
@@ -174,16 +185,12 @@ HDRS = {"Accept": "application/json"}
 
 @st.cache_data(show_spinner=False, ttl=60 * 30)
 def breeam_get(path: str, params=None):
-    # path przyjmujemy w stylu "/schemes" albo "schemes"
     p = path.lstrip("/")
     url = f"{BREEAM_BASE.rstrip('/')}/{p}"
     r = requests.get(url, auth=auth, headers=HDRS, params=params, timeout=60)
-
     if r.status_code == 401:
         raise RuntimeError("401 Unauthorized – sprawdź login/hasło/uprawnienia.")
     r.raise_for_status()
-
-    # czasem API zwraca tekst – zabezpieczenie
     try:
         return r.json()
     except Exception:
@@ -192,26 +199,15 @@ def breeam_get(path: str, params=None):
 @st.cache_data(show_spinner=False, ttl=60 * 30)
 def breeam_countries():
     data = breeam_get("/countries")
-    # różne możliwe struktury
-    countries = (
-        data.get("results", {})
-            .get("countries", {})
-            .get("country", None)
-    )
+    countries = data.get("results", {}).get("countries", {}).get("country", None)
     if countries is None:
-        # fallback: szukaj po kluczach
         countries = data.get("countries") or data.get("country") or []
     return list(sorted([c for c in _listify(countries) if isinstance(c, str)]))
 
 @st.cache_data(show_spinner=False, ttl=60 * 30)
 def breeam_schemes_df():
     data = breeam_get("/schemes")
-
-    # Najczęstsza struktura:
-    # results -> schemes -> scheme -> [ ... ]
     base = data.get("results", {}).get("schemes", {}).get("scheme", None)
-
-    # fallbacky (czasem inaczej)
     if base is None:
         base = data.get("results", {}).get("scheme", None)
     if base is None:
@@ -220,19 +216,15 @@ def breeam_schemes_df():
         base = data.get("scheme", None)
 
     schemes = _listify(base)
-
     items = []
     for s in schemes:
         if not isinstance(s, dict):
             continue
-
         sid = s.get("schemeID") or s.get("id") or s.get("schemeId")
         sname = s.get("schemeName") or s.get("name") or s.get("scheme")
-
         if sid is not None and sname is not None:
-            items.append({"schemeID": sid, "schemeName": sname})
+            items.append({"schemeID": sid, "schemeName": str(sname)})
 
-        # subSchemes bywa: {"scheme":[...]} albo {"scheme":{...}}
         subs = s.get("subSchemes", {}).get("scheme", None)
         for ss in _listify(subs):
             if not isinstance(ss, dict):
@@ -240,18 +232,14 @@ def breeam_schemes_df():
             ssid = ss.get("schemeID") or ss.get("id") or ss.get("schemeId")
             ssname = ss.get("schemeName") or ss.get("name") or ss.get("scheme")
             if ssid is not None and ssname is not None:
-                parent = str(sname) if sname is not None else ""
-                items.append({"schemeID": ssid, "schemeName": f"{parent} / {ssname}".strip(" /")})
+                items.append({"schemeID": ssid, "schemeName": f"{sname} / {ssname}".strip(" /")})
 
     df = pd.DataFrame(items)
     if not df.empty:
-        # ujednolicenie typów
         df["schemeName"] = df["schemeName"].astype(str)
-        # schemeID potrafi być stringiem – konwersja „miękka”
-        df["schemeID"] = pd.to_numeric(df["schemeID"], errors="ignore")
         df = df.drop_duplicates()
 
-    return df, data  # zwracamy też surowy JSON do diagnostyki
+    return df, data
 
 def normalize_breeam_from_api(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -298,11 +286,13 @@ def compute_breeam_expiries(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def breeam_fetch_api(country: str | None, scheme_id: int | None) -> pd.DataFrame:
+    # kluczowa zmiana: jeśli scheme_id jest None -> pobieramy /assessments (bez scheme)
     path = f"/assessments/{scheme_id}" if scheme_id else "/assessments"
     params = {}
     if country:
         params["country"] = country
     data = breeam_get(path, params)
+
     raw = data.get("results", {}).get("assessments", {}).get("assessment", None)
     if raw is None:
         raw = data.get("assessments") or data.get("assessment") or []
@@ -319,20 +309,15 @@ with c1:
     sel_country_lbl = st.selectbox("Państwo (API)", opts_c, index=idx_pl, key="b_country")
     sel_country = None if sel_country_lbl == "(dowolne)" else sel_country_lbl
 
-# --- schemes (z diagnostyką) ---
 df_schemes, schemes_raw = breeam_schemes_df()
 
 with c2:
-    if not df_schemes.empty and "schemeName" in df_schemes.columns and "schemeID" in df_schemes.columns:
-        # tylko In-Use
+    if not df_schemes.empty and {"schemeID", "schemeName"}.issubset(set(df_schemes.columns)):
         df_inuse = df_schemes[df_schemes["schemeName"].str.contains("in-use", case=False, na=False)].copy()
+        if df_inuse.empty:
+            df_inuse = df_schemes.copy()
 
         opts_s = df_inuse["schemeName"].tolist()
-        if not opts_s:
-            st.warning("Nie znaleziono scheme zawierających 'In-Use' na liście. Możesz wybrać dowolny scheme poniżej (fallback).")
-            df_inuse = df_schemes.copy()
-            opts_s = df_inuse["schemeName"].tolist()
-
         default_idx = 0
         for i, nm in enumerate(opts_s):
             if str(nm).strip().lower() == "in-use":
@@ -342,18 +327,14 @@ with c2:
         sel_scheme_name = st.selectbox("Rodzaj certyfikacji (scheme)", opts_s, index=default_idx, key="b_scheme")
         scheme_row = df_inuse.loc[df_inuse["schemeName"] == sel_scheme_name].head(1)
         sel_scheme_id = scheme_row["schemeID"].iloc[0]
-
-        # konwersja schemeID -> int jeśli się da
         try:
             sel_scheme_id = int(sel_scheme_id)
         except Exception:
-            pass
-
-        manual_scheme_id = None
+            sel_scheme_id = None
     else:
-        st.error("Nie udało się zbudować listy scheme z /schemes. Użyj trybu ręcznego (schemeID).")
-        manual_scheme_id = st.number_input("schemeID (ręcznie)", min_value=1, step=1, value=1)
-        sel_scheme_id = int(manual_scheme_id)
+        # ZMIANA: zamiast ręcznego schemeID -> pobierz bez scheme (czyli /assessments)
+        st.warning("Nie udało się zbudować listy scheme z /schemes. Pobiorę dane bez schemeID (endpoint /assessments).")
+        sel_scheme_id = None
 
 left_btn, right_btn = st.columns([1, 1])
 
@@ -377,19 +358,36 @@ if right_btn.button("Reset filtrów", key="btn_breeam_reset"):
             del st.session_state[k]
     st.success("Filtry zresetowane.")
 
-# ================== DIAGNOSTYKA /schemes ==================
-with st.expander("Diagnostyka: /schemes", expanded=False):
+# ================== DIAGNOSTYKA ==================
+with st.expander("Diagnostyka: /schemes + /countries + sample /assessments", expanded=False):
     st.write("BREEAM_BASE:", BREEAM_BASE)
-    st.write("Liczba rekordów df_schemes:", int(len(df_schemes)))
-    st.write("Kolumny:", list(df_schemes.columns) if isinstance(df_schemes, pd.DataFrame) else "—")
+    st.write("df_schemes rows:", int(len(df_schemes)))
+    st.write("df_schemes cols:", list(df_schemes.columns) if isinstance(df_schemes, pd.DataFrame) else "—")
     if isinstance(df_schemes, pd.DataFrame) and not df_schemes.empty:
-        st.dataframe(df_schemes.head(30), use_container_width=True)
-    st.markdown("**Surowa odpowiedź (pierwsze ~1500 znaków JSON):**")
+        st.dataframe(df_schemes.head(20), use_container_width=True)
+
+    st.markdown("**/schemes raw (pierwsze ~1200 znaków):**")
     try:
         raw_txt = json.dumps(schemes_raw, ensure_ascii=False)
-        st.code(raw_txt[:1500] + ("…" if len(raw_txt) > 1500 else ""), language="json")
+        st.code(raw_txt[:1200] + ("…" if len(raw_txt) > 1200 else ""), language="json")
     except Exception as e:
         st.write("Nie udało się pokazać JSON:", e)
+
+    try:
+        c_raw = breeam_get("/countries")
+        st.markdown("**/countries raw (pierwsze ~800 znaków):**")
+        c_txt = json.dumps(c_raw, ensure_ascii=False)
+        st.code(c_txt[:800] + ("…" if len(c_txt) > 800 else ""), language="json")
+    except Exception as e:
+        st.write("Błąd /countries:", e)
+
+    try:
+        a_raw = breeam_get("/assessments", params={"country": sel_country} if sel_country else None)
+        st.markdown("**/assessments raw (pierwsze ~800 znaków):**")
+        a_txt = json.dumps(a_raw, ensure_ascii=False)
+        st.code(a_txt[:800] + ("…" if len(a_txt) > 800 else ""), language="json")
+    except Exception as e:
+        st.write("Błąd /assessments:", e)
 
 st.divider()
 
@@ -525,8 +523,6 @@ else:
 
     with col_map:
         st.write("**Mapa lokalizacji**")
-
-        # BREEAM API czasem ma lat/lon jako różne nazwy
         lat = None
         lon = None
 
