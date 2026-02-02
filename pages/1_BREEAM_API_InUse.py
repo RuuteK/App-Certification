@@ -1,3 +1,4 @@
+# pages/1_BREEAM_API_InUse.py
 import os, re, json, requests, pandas as pd
 from datetime import date
 from dateutil import parser as dtparser
@@ -24,22 +25,21 @@ st.set_page_config(page_title="BREEAM aktualne", layout="wide")
 def nav_buttons(active: str = "breeam_api"):
     c1, c2, c3, c4 = st.columns(4, gap="medium")
     with c1:
-        if st.button("🏠 Home", use_container_width=True, disabled=(active=="home")):
+        if st.button("🏠 Home", use_container_width=True, disabled=(active == "home")):
             st.switch_page("app.py")
     with c2:
-        if st.button("🏢 BREEAM aktualne", use_container_width=True, disabled=(active=="breeam_api")):
+        if st.button("🏢 BREEAM aktualne", use_container_width=True, disabled=(active == "breeam_api")):
             st.switch_page("pages/1_BREEAM_API_InUse.py")
     with c3:
-        if st.button("⛔ BREEAM wygasłe", use_container_width=True, disabled=(active=="breeam_exp")):
+        if st.button("⛔ BREEAM wygasłe", use_container_width=True, disabled=(active == "breeam_exp")):
             st.switch_page("pages/2_BREEAM_Wygasle_Excel.py")
     with c4:
-        if st.button("📄 LEED", use_container_width=True, disabled=(active=="leed")):
+        if st.button("📄 LEED", use_container_width=True, disabled=(active == "leed")):
             st.switch_page("pages/3_LEED_Excel.py")
 
 nav_buttons("breeam_api")
 
 st.title("🏢 BREEAM aktualne")
-#st.caption("Pobieranie certyfikacji BREEAM In-Use z API + filtry + szczegóły + mapa.")
 
 # ================== HELPERY ==================
 DATE_RX = re.compile(
@@ -94,7 +94,10 @@ def add_expiry_status(df: pd.DataFrame) -> pd.DataFrame:
             return "🟡 12–18 mies."
         return "✅ > 18 mies."
 
-    df["expiry_status"] = df["months_to_expiry"].apply(status) if "months_to_expiry" in df.columns else "❓ Brak daty"
+    if "months_to_expiry" in df.columns:
+        df["expiry_status"] = df["months_to_expiry"].apply(status)
+    else:
+        df["expiry_status"] = "❓ Brak daty"
     return df
 
 def color_rows_by_expiry(row):
@@ -132,9 +135,6 @@ def first_nonempty(row: pd.Series, candidates, default=""):
     return default
 
 def build_address(row: pd.Series) -> str:
-    """
-    Próbuje złożyć konkretny adres z wielu możliwych pól API.
-    """
     street = first_nonempty(row, ["regAddresLine1", "regAddressLine1", "addressLine1", "address", "Address1", "Address"], "")
     street2 = first_nonempty(row, ["regAddresLine2", "regAddressLine2", "addressLine2", "Address2"], "")
     postcode = first_nonempty(row, ["postcode", "postCode", "zip", "zipCode", "postalCode", "PostalCode"], "")
@@ -176,18 +176,61 @@ def breeam_countries():
     return list(sorted(data.get("results", {}).get("countries", {}).get("country", [])))
 
 @st.cache_data(show_spinner=False, ttl=60*30)
-def breeam_schemes_df():
+def breeam_schemes_df() -> pd.DataFrame:
+    """
+    Bezpieczny parser /schemes:
+    - obsługuje list/dict/None
+    - zawsze zwraca DF z kolumnami schemeID, schemeName
+    """
     data = breeam_get("/schemes")
+
+    schemes = (
+        data.get("results", {})
+            .get("schemes", {})
+            .get("scheme", [])
+    )
+
+    if isinstance(schemes, dict):
+        schemes = [schemes]
+    if schemes is None:
+        schemes = []
+
     items = []
-    for s in data.get("results", {}).get("schemes", {}).get("scheme", []):
-        items.append({"schemeID": s["schemeID"], "schemeName": s["schemeName"]})
+    for s in schemes:
+        if not isinstance(s, dict):
+            continue
+
+        sid = s.get("schemeID")
+        sname = s.get("schemeName")
+        if sid is not None and sname is not None:
+            items.append({"schemeID": sid, "schemeName": sname})
+
         sub = s.get("subSchemes", {}).get("scheme", [])
         if isinstance(sub, dict):
             sub = [sub]
+        if sub is None:
+            sub = []
+
         for ss in sub:
-            if ss:
-                items.append({"schemeID": ss["schemeID"], "schemeName": f'{s["schemeName"]} / {ss["schemeName"]}'})
-    return pd.DataFrame(items).drop_duplicates()
+            if not isinstance(ss, dict):
+                continue
+            ssid = ss.get("schemeID")
+            ssname = ss.get("schemeName")
+            if ssid is not None and ssname is not None and sname is not None:
+                items.append({"schemeID": ssid, "schemeName": f"{sname} / {ssname}"})
+
+    df = pd.DataFrame(items)
+
+    # ✅ gwarantuj kolumny nawet gdy pusto
+    if df.empty:
+        df = pd.DataFrame(columns=["schemeID", "schemeName"])
+    else:
+        for c in ["schemeID", "schemeName"]:
+            if c not in df.columns:
+                df[c] = pd.NA
+        df = df[["schemeID", "schemeName"]].drop_duplicates()
+
+    return df
 
 def normalize_breeam_from_api(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -234,6 +277,10 @@ def breeam_fetch_api(country: str | None, scheme_id: int | None) -> pd.DataFrame
         params["country"] = country
     data = breeam_get(path, params)
     raw = data.get("results", {}).get("assessments", {}).get("assessment", []) or []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if raw is None:
+        raw = []
     return pd.DataFrame(raw)
 
 # ================== UI: FILTRY POBIERANIA ==================
@@ -248,13 +295,29 @@ with c1:
 
 with c2:
     df_schemes = breeam_schemes_df()
-    df_inuse = df_schemes[df_schemes["schemeName"].str.contains("in-use", case=False, na=False)].copy()
-    opts_s = df_inuse["schemeName"].tolist()
-    if not opts_s:
-        st.error("Nie znaleziono scheme zawierających 'In-Use' w API /schemes.")
+
+    with st.expander("Diagnostyka: /schemes"):
+        st.write("BREEAM_BASE:", BREEAM_BASE)
+        st.write("Liczba rekordów df_schemes:", len(df_schemes))
+        st.write("Kolumny:", list(df_schemes.columns))
+        st.dataframe(df_schemes.head(30), use_container_width=True)
+
+    if df_schemes.empty or "schemeName" not in df_schemes.columns:
+        st.error(
+            "Nie udało się pobrać listy schematów z /schemes (brak danych lub brak kolumny schemeName). "
+            "Sprawdź diagnostykę powyżej."
+        )
         st.stop()
 
-    # Ułatwienie: jeśli na liście jest dokładnie "In-Use", ustaw je jako default
+    df_inuse = df_schemes[
+        df_schemes["schemeName"].astype(str).str.contains("in-use", case=False, na=False)
+    ].copy()
+
+    opts_s = df_inuse["schemeName"].tolist()
+    if not opts_s:
+        st.error("Nie znaleziono scheme zawierających 'In-Use' w API /schemes. Sprawdź diagnostykę /schemes.")
+        st.stop()
+
     default_idx = 0
     for i, nm in enumerate(opts_s):
         if str(nm).strip().lower() == "in-use":
@@ -363,14 +426,16 @@ view = st.radio(
     key="b_view",
 )
 
-if view == "≤ 6 mies.":
-    df = df[pd.to_numeric(df["months_to_expiry"], errors="coerce").between(0, 6, inclusive="both")].copy()
-elif view == "6–12 mies.":
-    df = df[pd.to_numeric(df["months_to_expiry"], errors="coerce").between(7, 12, inclusive="both")].copy()
-elif view == "12–18 mies.":
-    df = df[pd.to_numeric(df["months_to_expiry"], errors="coerce").between(12, 18, inclusive="both")].copy()
-elif view == "> 18 mies.":
-    df = df[pd.to_numeric(df["months_to_expiry"], errors="coerce") > 18].copy()
+if "months_to_expiry" in df.columns:
+    mm = pd.to_numeric(df["months_to_expiry"], errors="coerce")
+    if view == "≤ 6 mies.":
+        df = df[mm.between(0, 6, inclusive="both")].copy()
+    elif view == "6–12 mies.":
+        df = df[mm.between(7, 12, inclusive="both")].copy()
+    elif view == "12–18 mies.":
+        df = df[mm.between(12, 18, inclusive="both")].copy()
+    elif view == "> 18 mies.":
+        df = df[mm > 18].copy()
 
 st.divider()
 
